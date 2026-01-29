@@ -1,3 +1,4 @@
+# @title
 import os
 import nibabel as nib
 import torch
@@ -12,48 +13,74 @@ class BraTSMRIDataset(Dataset):
         self.samples = []
         self.augment = augment
         self._prepare_samples()
-        
-    """ 
-    It actually iterates through the all the patients and finds the center of the tumor z
+
+    """
+    It actually iterates through all the patients and finds the center of the tumor z
     and then the slice numbers that are to be included within the boundaries of the 3d volume
-    and append all the slice numbers to the samples 
+    and append all the slice numbers to the samples
     """
 
     def _prepare_samples(self):
-        patients = sorted(os.listdir(self.root_dir))
+        print(f"Checking root directory: {self.root_dir}")
+        if not os.path.exists(self.root_dir):
+            print(f"Error: Root directory does not exist: {self.root_dir}")
+            return
 
-        for patient in patients:
-            patient_path = os.path.join(self.root_dir, patient)
+        patient_dirs = []
 
-            seg_path = os.path.join(
-                patient_path,
-                [f for f in os.listdir(patient_path) if "seg" in f][0]
-            )
+        # Check if root_dir itself is a patient directory (contains a 'seg' file)
+        if any("seg" in f for f in os.listdir(self.root_dir) if os.path.isfile(os.path.join(self.root_dir, f))):
+            patient_dirs.append(self.root_dir)
+            print(f"Treating root directory as a single patient folder: {self.root_dir}")
+        else:
+            # Otherwise, assume root_dir contains multiple patient subdirectories
+            items_in_root = sorted(os.listdir(self.root_dir))
+            for item in items_in_root:
+                full_path = os.path.join(self.root_dir, item)
+                if os.path.isdir(full_path):
+                    patient_dirs.append(full_path)
+            print(f"Found {len(patient_dirs)} patient subdirectories in {self.root_dir}")
 
-            seg = nib.load(seg_path).get_fdata()
-            depth = seg.shape[2]
+        if not patient_dirs:
+            print(f"No valid patient directories found in {self.root_dir}")
+            return
 
-            tumor_slices = [i for i in range(depth) if seg[:, :, i].sum() > 0]
-            if len(tumor_slices) == 0:
-                continue
+        for patient_path in patient_dirs:
+            try:
+                seg_files = [f for f in os.listdir(patient_path) if "seg" in f]
+                if not seg_files:
+                    print(f"No segmentation file found for patient: {patient_path}. Skipping.")
+                    continue
+                seg_path = os.path.join(patient_path, seg_files[0])
 
-            z_min, z_max = min(tumor_slices), max(tumor_slices)
-            num_tumor = len(tumor_slices)
+                seg = nib.load(seg_path).get_fdata()
+                depth = seg.shape[2]
 
-            for z in tumor_slices:
-                self.samples.append((patient_path, z))
+                tumor_slices = [i for i in range(depth) if seg[:, :, i].sum() > 0]
+                if len(tumor_slices) == 0:
+                    print(f"No tumor slices found for patient: {patient_path}. Skipping.")
+                    continue
 
-            left_available  = z_min
-            right_available = depth - z_max - 1
+                z_min, z_max = min(tumor_slices), max(tumor_slices)
+                num_tumor = len(tumor_slices)
 
-            left_to_take  = min(num_tumor, left_available)
-            right_to_take = min(num_tumor, right_available)
+                for z in tumor_slices:
+                    self.samples.append((patient_path, z))
 
-            for i in range(1, left_to_take + 1):
-                self.samples.append((patient_path, z_min - i))
+                left_available  = z_min
+                right_available = depth - z_max - 1
 
-            for i in range(1, right_to_take + 1):
-                self.samples.append((patient_path, z_max + i))
+                left_to_take  = min(num_tumor, left_available)
+                right_to_take = min(num_tumor, right_available)
+
+                for i in range(1, left_to_take + 1):
+                    self.samples.append((patient_path, z_min - i))
+
+                for i in range(1, right_to_take + 1):
+                    self.samples.append((patient_path, z_max + i))
+                print(f"Added {len(tumor_slices) + left_to_take + right_to_take} samples for patient {os.path.basename(patient_path)}")
+            except Exception as e:
+                print(f"Error processing patient {patient_path}: {e}")
 
     def __len__(self):
         return len(self.samples)
@@ -86,11 +113,20 @@ class BraTSMRIDataset(Dataset):
         t2    = nib.load(os.path.join(patient_path, [f for f in os.listdir(patient_path) if "_t2." in f][0])).get_fdata()
         seg   = nib.load(os.path.join(patient_path, [f for f in os.listdir(patient_path) if "seg" in f][0])).get_fdata()
 
-        flair = torch.tensor(flair[:, :, slice_idx]).unsqueeze(0)
-        t1    = torch.tensor(t1[:, :, slice_idx]).unsqueeze(0)
-        t1ce  = torch.tensor(t1ce[:, :, slice_idx]).unsqueeze(0)
-        t2    = torch.tensor(t2[:, :, slice_idx]).unsqueeze(0)
-        seg   = torch.tensor(seg[:, :, slice_idx]).unsqueeze(0)
+        # Extract 3D patch centered at slice_idx (depth of 16 slices for proper pooling)
+        depth = 16
+        z_start = max(0, slice_idx - depth // 2)
+        z_end = min(flair.shape[2], z_start + depth)
+
+        # Pad if necessary
+        if z_end - z_start < depth:
+            z_start = max(0, z_end - depth)
+
+        flair = torch.tensor(flair[:, :, z_start:z_end]).unsqueeze(0).float()
+        t1    = torch.tensor(t1[:, :, z_start:z_end]).unsqueeze(0).float()
+        t1ce  = torch.tensor(t1ce[:, :, z_start:z_end]).unsqueeze(0).float()
+        t2    = torch.tensor(t2[:, :, z_start:z_end]).unsqueeze(0).float()
+        seg   = torch.tensor(seg[:, :, z_start:z_end]).unsqueeze(0).float()
 
         # per-channel normalization
         flair = self._normalize_channel(flair)
@@ -101,17 +137,14 @@ class BraTSMRIDataset(Dataset):
         image = torch.cat([flair, t1, t1ce, t2], dim=0)
         mask = (seg > 0).float()
 
-        image = F.interpolate(image.unsqueeze(0), size=(128, 128),
-                              mode="bilinear", align_corners=False).squeeze(0)
-        mask = F.interpolate(mask.unsqueeze(0), size=(128, 128),
+        # Reduce resolution to save memory
+        image = F.interpolate(image.unsqueeze(0), size=(8, 64, 64),
+                              mode="trilinear", align_corners=False).squeeze(0)
+        mask = F.interpolate(mask.unsqueeze(0), size=(8, 64, 64),
                              mode="nearest").squeeze(0)
 
         if self.augment:
             image, mask = self._augment(image, mask)
 
-        # class-imbalance pixel weight map
-        pos = mask.sum()
-        neg = mask.numel() - pos
-        weight_map = torch.where(mask == 1, neg / (pos + 1e-8), torch.tensor(1.0))
 
-        return image, mask, weight_map
+        return image, mask
